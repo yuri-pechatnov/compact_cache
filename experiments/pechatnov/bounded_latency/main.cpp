@@ -18,6 +18,9 @@ public:
     static inline constexpr TIndex NilIndex = static_cast<TIndex>(-1);
     static inline constexpr TValue NilValue = {static_cast<char*>(nullptr), 0u};
 
+    TTrivialStringsStorage(uint64_t)
+    { }
+
     std::pair<TValue, TIndex> Allocate(uint64_t size)
     {
         ElementsCount_ += 1;
@@ -68,9 +71,9 @@ public:
     static inline constexpr TIndex NilIndex = static_cast<TIndex>(-1);
     static inline constexpr TValue NilValue = {static_cast<char*>(nullptr), 0u};
 
-    TBlobStringsStorage()
+    TBlobStringsStorage(uint64_t bufferSize)
     {
-        Data_.resize(1000000); // TODO
+        Data_.resize(bufferSize);
     }
 
     std::pair<TValue, TIndex> Allocate(uint64_t size)
@@ -85,7 +88,7 @@ public:
 
     TValue Get(TIndex index)
     {
-        if (index >= Positions_.size() || Positions_[index] == nullptr) {
+        if (index >= Positions_.size() || Positions_[index] < 0) {
             return NilValue;
         }
         return GetValue(index);
@@ -93,7 +96,7 @@ public:
 
     bool Free(TIndex index)
     {
-        if (index >= Positions_.size() || Positions_[index] == nullptr) {
+        if (index >= Positions_.size() || Positions_[index] < 0) {
             return false;
         }
         Erase(index, RootIndex_);
@@ -131,6 +134,7 @@ private:
     };
     static_assert(alignof(TIndex) == 4);
     static_assert(alignof(THeader) == 4);
+    static_assert(sizeof(THeader) == 32); // Not invariant, just check.
 
     uint64_t GetFreeSpace(TIndex idx, char* first, char* last)
     {
@@ -182,7 +186,7 @@ private:
         TIndex left = NilIndex;
         TIndex right = NilIndex;
         char* position = HardSplit(size + sizeof(THeader), root, left, right, first, last);
-        Positions_[idx] = position;
+        Positions_[idx] = position - Data_.data();
         auto& header = GetHeader(idx);
         header.ValueSize = size;
         header.LeftIndex = NilIndex;
@@ -290,7 +294,7 @@ private:
         auto rightChildIndex = header.RightIndex;
         Defragmentate(header.LeftIndex, first);
 
-        Positions_[root] = first;
+        Positions_[root] = first - Data_.data();
         const uint64_t fullSize = header.GetLastPosition() - header.GetFirstPosition();
         std::memmove(first, header.GetFirstPosition(), fullSize); // Now `header` is invalid.
         first += fullSize;
@@ -301,41 +305,44 @@ private:
 
     TIndex AllocateIndex()
     {
-        if (FreeIndexes_.empty()) {
+        if (FirstFreeIndex_ == NilIndex) {
             TIndex idx = Positions_.size();
-            Positions_.resize(std::max<size_t>(Positions_.size(), 1u) * 2);
+            Positions_.resize(std::max<size_t>(Positions_.size(), 2u) * 3 / 2);
             for (; idx < Positions_.size(); idx++) {
-                Positions_[idx] = nullptr;
-                FreeIndexes_.push_back(idx);
+                FreeIndex(idx);
             }
         }
-        auto idx = FreeIndexes_.back();
-        FreeIndexes_.pop_back();
+        auto idx = FirstFreeIndex_;
+        FirstFreeIndex_ = -(Positions_[idx] + 1);
         return idx;
     }
 
     void FreeIndex(TIndex index)
     {
-        Positions_[index] = nullptr;
-        FreeIndexes_.push_back(index);
+        Positions_[index] = -static_cast<int64_t>(FirstFreeIndex_ + 1);
+        FirstFreeIndex_ = index;
     }
 
     THeader& GetHeader(TIndex index)
     {
-        assert(index < Positions_.size() && Positions_[index] != nullptr);
-        return *reinterpret_cast<THeader*>(Positions_[index]);
+        assert(index < Positions_.size() && Positions_[index] >= 0);
+        return *reinterpret_cast<THeader*>(Data_.data() + Positions_[index]);
     }
 
     TValue GetValue(TIndex index)
     {
-        return {Positions_[index] + sizeof(THeader), GetHeader(index).ValueSize};
+        return {Data_.data() + Positions_[index] + sizeof(THeader), GetHeader(index).ValueSize};
     }
 
 private:
     std::vector<char> Data_;
-    std::vector<char*> Positions_;
-    std::vector<TIndex> FreeIndexes_;
+
+    // Overhead per one element is sizeof(char*) * 3 / 2 = 12.
+    // Positions_[idx] >= 0 -> it is a position of idx node in Data_,
+    // Positions_[idx] < 0 -> -(Positions_[idx] + 1) is a next free node index (can be nil).
+    std::vector<int64_t> Positions_;
     TIndex RootIndex_ = NilIndex;
+    TIndex FirstFreeIndex_ = NilIndex;
 
     uint64_t ElementsCount_ = 0;
 };
@@ -345,7 +352,7 @@ using TStringsStorage = TBlobStringsStorage;
 
 void SS_SimpleTest()
 {
-    TStringsStorage storage;
+    TStringsStorage storage(1000000);
 
     static auto fill = [](TStringsStorage::TIndex index, TStringsStorage::TValue value) {
         for (auto& e : value) {
@@ -392,14 +399,15 @@ public:
     static inline constexpr TIndex NilIndex = TStringsStorage::NilIndex;
     static inline constexpr TValue NilValue = TStringsStorage::NilValue;
 
-    TStrStrHashMap()
+    TStrStrHashMap(uint64_t bufferSize)
+        : Storage_(bufferSize)
     {
         HashTable_.assign(1, NilIndex);
     }
 
     std::pair<TValue, TIndex> PutUnitialized(std::string_view key, uint64_t valueSize)
     {
-        if (Storage_.ElementsCount() + 1 > HashTable_.size()) {
+        if (Storage_.ElementsCount() + 1 > HashTable_.size() * 2) {
             DoubleHashTable();
         }
 
@@ -478,6 +486,7 @@ private:
         TIndex ListNext;
     };
     static_assert(alignof(THeader) == 4);
+    static_assert(sizeof(THeader) == 16); // Not invariant, just check.
 
     uint64_t Hash(std::string_view key)
     {
@@ -563,12 +572,13 @@ private:
 
 private:
     TStringsStorage Storage_;
+    // Overhead per one element is sizeof(TIndex) = 4.
     std::vector<TIndex> HashTable_;
 };
 
 void SSHM_SimpleTest()
 {
-    TStrStrHashMap m;
+    TStrStrHashMap m(1000000);
     auto [val1, idx1] = m.Put("key1", "value1");
     assert(m.Get("key1").first == "value1"sv);
     auto [val2, idx2] = m.Put("key2", "value2");
