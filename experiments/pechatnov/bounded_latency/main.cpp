@@ -109,14 +109,14 @@ public:
     }
 private:
 
-    struct THeader {
-        uint64_t InnerFreeSpace; // Computable.
-        uint64_t ValueSize; // Const.
+    struct __attribute__ ((__packed__)) alignas(TIndex) THeader {
+        uint64_t InnerFreeSpace : 40; // Computable.
+        uint64_t ValueSize : 40; // Const.
+        uint64_t HeapPriority : 48; // Const.
         TIndex LeftIndex; // Tree structure.
         TIndex RightIndex; // Tree structure.
         TIndex LeftestIndex; // Computable. Never nil.
         TIndex RightestIndex; // Computable. Never nil.
-        uint32_t HeapPriority; // Const.
 
         char* GetFirstPosition()
         {
@@ -125,10 +125,12 @@ private:
 
         char* GetLastPosition()
         {
-            const auto roundedValueSize = (ValueSize + 7) / 8 * 8; // Hack for aligned memory. Can be done better.
+            const auto roundedValueSize = (ValueSize + 3) / 4 * 4; // Hack for aligned memory. Can be done better.
             return reinterpret_cast<char*>(this) + sizeof(THeader) + roundedValueSize;
         }
     };
+    static_assert(alignof(TIndex) == 4);
+    static_assert(alignof(THeader) == 4);
 
     uint64_t GetFreeSpace(TIndex idx, char* first, char* last)
     {
@@ -401,7 +403,7 @@ public:
             DoubleHashTable();
         }
 
-        const uint64_t keyHash = std::hash<std::string_view>{}(key);
+        const uint64_t keyHash = Hash(key);
         const uint64_t bucket = keyHash % HashTable_.size();
         EraseFromBucket(bucket, keyHash, key); // Remove old element if exists.
 
@@ -425,8 +427,8 @@ public:
 
     std::pair<TValue, TIndex> Get(std::string_view key)
     {
-        const uint64_t keyHash = std::hash<std::string_view>{}(key);
-        auto idx = FindInBucket(keyHash % HashTable_.size(), keyHash, key);
+        const uint64_t keyHash = Hash(key);
+        auto [prevIdx, idx] = FindInBucket(keyHash % HashTable_.size(), keyHash, key);
         return {Get(idx), idx};
     }
 
@@ -441,7 +443,7 @@ public:
 
     bool Erase(std::string_view key)
     {
-        const uint64_t keyHash = std::hash<std::string_view>{}(key);
+        const uint64_t keyHash = Hash(key);
         auto erasedIdx = EraseFromBucket(keyHash % HashTable_.size(), keyHash, key);
         if (erasedIdx == NilIndex) {
             return false;
@@ -467,13 +469,20 @@ public:
     }
 
 private:
-    struct THeader
+    struct __attribute__ ((__packed__)) alignas(TIndex) THeader
     {
-        uint64_t KeyHash;
-        TIndex ListLeft;
-        TIndex ListRight;
-        uint64_t KeySize;
+        static constexpr uint64_t KeyHashMask = (1ull << 56) - 1;
+
+        uint64_t KeyHash : 56;
+        uint64_t KeySize : 40;
+        TIndex ListNext;
     };
+    static_assert(alignof(THeader) == 4);
+
+    uint64_t Hash(std::string_view key)
+    {
+        return std::hash<std::string_view>{}(key) & THeader::KeyHashMask;
+    }
 
     uint64_t CalculateSize(uint64_t keySize, uint64_t valueSize)
     {
@@ -496,34 +505,34 @@ private:
         return svalue.subspan(sizeof(THeader) + GetHeader(svalue).KeySize);
     }
 
-    TIndex FindInBucket(uint64_t bucket, uint64_t hash, std::string_view key)
+    // (prevIndex, foundIndex) or (nil, nil)
+    std::pair<TIndex, TIndex> FindInBucket(uint64_t bucket, uint64_t hash, std::string_view key)
     {
+        TIndex prevIdx = NilIndex;
         TIndex idx = HashTable_[bucket];
         while (idx != NilIndex) {
             auto sval = Storage_.Get(idx);
             auto& header = GetHeader(sval);
             if (header.KeyHash == hash && key == GetKey(sval)) {
-                return idx;
+                return {prevIdx, idx};
             }
-            idx = header.ListRight;
+            prevIdx = idx;
+            idx = header.ListNext;
         }
-        return NilIndex;
+        return {NilIndex, NilIndex};
     }
 
     TIndex EraseFromBucket(uint64_t bucket, uint64_t hash, std::string_view key)
     {
-        auto idx = FindInBucket(bucket, hash, key);
+        auto [prevIdx, idx] = FindInBucket(bucket, hash, key);
         if (idx != NilIndex) {
             auto sval = Storage_.Get(idx);
             auto& header = GetHeader(sval);
-            if (header.ListLeft == NilIndex) {
+            if (prevIdx == NilIndex) {
                 assert(idx == HashTable_[bucket]);
-                HashTable_[bucket] = header.ListRight;
+                HashTable_[bucket] = header.ListNext;
             } else {
-                GetHeader(Storage_.Get(header.ListLeft)).ListRight = header.ListRight;
-            }
-            if (header.ListRight != NilIndex) {
-                GetHeader(Storage_.Get(header.ListRight)).ListLeft = header.ListLeft;
+                GetHeader(Storage_.Get(prevIdx)).ListNext = header.ListNext;
             }
             return idx;
         }
@@ -532,15 +541,8 @@ private:
 
     void InsertToBucket(uint64_t bucket, TIndex idx, THeader& header)
     {
-        const TIndex oldIdx = HashTable_[bucket];
+        header.ListNext = HashTable_[bucket];
         HashTable_[bucket] = idx;
-
-        header.ListLeft = NilIndex;
-        header.ListRight = oldIdx;
-
-        if (oldIdx != NilIndex) {
-            GetHeader(Storage_.Get(oldIdx)).ListLeft = idx;
-        }
     }
 
     void DoubleHashTable()
@@ -552,9 +554,9 @@ private:
             while (idx != NilIndex) {
                 auto sval = Storage_.Get(idx);
                 auto& header = GetHeader(sval);
-                auto rightIdx = header.ListRight;
+                auto nextIdx = header.ListNext;
                 InsertToBucket(header.KeyHash % HashTable_.size(), idx, header);
-                idx = rightIdx;
+                idx = nextIdx;
             }
         }
     }
