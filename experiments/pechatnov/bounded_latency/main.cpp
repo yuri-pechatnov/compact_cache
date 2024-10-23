@@ -125,7 +125,8 @@ private:
 
         char* GetLastPosition()
         {
-            return reinterpret_cast<char*>(this) + sizeof(THeader) + ValueSize;
+            const auto roundedValueSize = (ValueSize + 7) / 8 * 8; // Hack for aligned memory. Can be done better.
+            return reinterpret_cast<char*>(this) + sizeof(THeader) + roundedValueSize;
         }
     };
 
