@@ -113,13 +113,19 @@ public:
 private:
 
     struct __attribute__ ((__packed__)) alignas(TIndex) THeader {
-        uint64_t InnerFreeSpace : 40; // Computable.
-        uint64_t ValueSize : 40; // Const.
-        uint64_t HeapPriority : 48; // Const.
+        uint64_t LeftInnerFreeSpace : 37; // Computable.
+        uint64_t RightInnerFreeSpace : 37; // Computable.
+        uint64_t FirstSubtreeOffset : 37; // Computable.
+        uint64_t LastSubtreeOffset : 37; // Computable.
+        uint64_t ValueSize : 37; // Const.
+        uint64_t HeapPriority : 39; // Const.
         TIndex LeftIndex; // Tree structure.
         TIndex RightIndex; // Tree structure.
-        TIndex LeftestIndex; // Computable. Never nil.
-        TIndex RightestIndex; // Computable. Never nil.
+
+        uint64_t GetInnerFreeSpace()
+        {
+            return LeftInnerFreeSpace + RightInnerFreeSpace;
+        }
 
         char* GetFirstPosition()
         {
@@ -134,7 +140,17 @@ private:
     };
     static_assert(alignof(TIndex) == 4);
     static_assert(alignof(THeader) == 4);
-    static_assert(sizeof(THeader) == 32); // Not invariant, just check.
+    static_assert(sizeof(THeader) == 36); // Not invariant, just check.
+
+    char* OffsetToPosition(uint64_t offset)
+    {
+        return Data_.data() + offset;
+    }
+
+    uint64_t PositionToOffset(char* position)
+    {
+        return position - Data_.data();
+    }
 
     uint64_t GetFreeSpace(TIndex idx, char* first, char* last)
     {
@@ -142,29 +158,45 @@ private:
             return last - first;
         }
         auto& header = GetHeader(idx);
-        assert(first <= GetHeader(header.LeftestIndex).GetFirstPosition());
-        assert(GetHeader(header.RightestIndex).GetLastPosition() <= last);
-        return (GetHeader(header.LeftestIndex).GetFirstPosition() - first) + header.InnerFreeSpace + (last - GetHeader(header.RightestIndex).GetLastPosition());
+        assert(first <= OffsetToPosition(header.FirstSubtreeOffset));
+        assert(OffsetToPosition(header.LastSubtreeOffset) <= last);
+        return (OffsetToPosition(header.FirstSubtreeOffset) - first) + header.GetInnerFreeSpace() + (last - OffsetToPosition(header.LastSubtreeOffset));
+    }
+
+    // Often we can avoid random-memory-access to right child. And recalculate calculated fields only for left child.
+    bool FixLeft(TIndex idx)
+    {
+        auto& header = GetHeader(idx);
+        const auto oldLeftInnerFreeSpace = header.LeftInnerFreeSpace;
+        const auto oldFirstSubtreeOffset = header.FirstSubtreeOffset;
+        header.LeftInnerFreeSpace = 0;
+        header.FirstSubtreeOffset = PositionToOffset(header.GetFirstPosition());
+        if (header.LeftIndex != NilIndex) {
+            auto& leftHeader = GetHeader(header.LeftIndex);
+            header.LeftInnerFreeSpace = leftHeader.GetInnerFreeSpace() + (header.GetFirstPosition() - OffsetToPosition(leftHeader.LastSubtreeOffset));
+            header.FirstSubtreeOffset = leftHeader.FirstSubtreeOffset;
+        }
+        return (oldLeftInnerFreeSpace != header.LeftInnerFreeSpace) || (oldFirstSubtreeOffset != header.FirstSubtreeOffset);
+    }
+
+    bool FixRight(TIndex idx)
+    {
+        auto& header = GetHeader(idx);
+        const auto oldRightInnerFreeSpace = header.RightInnerFreeSpace;
+        const auto oldLastSubtreeOffset = header.LastSubtreeOffset;
+        header.RightInnerFreeSpace = 0;
+        header.LastSubtreeOffset = PositionToOffset(header.GetLastPosition());
+        if (header.RightIndex != NilIndex) {
+            auto& rightHeader = GetHeader(header.RightIndex);
+            header.RightInnerFreeSpace = (OffsetToPosition(rightHeader.FirstSubtreeOffset) - header.GetLastPosition()) + rightHeader.GetInnerFreeSpace();
+            header.LastSubtreeOffset = rightHeader.LastSubtreeOffset;
+        }
+        return (oldRightInnerFreeSpace != header.RightInnerFreeSpace) || (oldLastSubtreeOffset != header.LastSubtreeOffset);
     }
 
     bool Fix(TIndex idx)
     {
-        auto& header = GetHeader(idx);
-        THeader oldHeader = header;
-        header.InnerFreeSpace = 0;
-        header.LeftestIndex = idx;
-        header.RightestIndex = idx;
-        if (header.LeftIndex != NilIndex) {
-            auto& leftHeader = GetHeader(header.LeftIndex);
-            header.InnerFreeSpace += leftHeader.InnerFreeSpace + (header.GetFirstPosition() - GetHeader(leftHeader.RightestIndex).GetLastPosition());
-            header.LeftestIndex = leftHeader.LeftestIndex;
-        }
-        if (header.RightIndex != NilIndex) {
-            auto& rightHeader = GetHeader(header.RightIndex);
-            header.InnerFreeSpace += rightHeader.InnerFreeSpace + (GetHeader(rightHeader.LeftestIndex).GetFirstPosition() - header.GetLastPosition());
-            header.RightestIndex = rightHeader.RightestIndex;
-        }
-        return (oldHeader.InnerFreeSpace != header.InnerFreeSpace) || (oldHeader.LeftestIndex != header.LeftestIndex) || (oldHeader.RightestIndex != header.RightestIndex);
+        return FixLeft(idx) || FixRight(idx);
     }
 
     void CheckTree(TIndex root)
@@ -175,7 +207,8 @@ private:
         auto& header = GetHeader(root);
         CheckTree(header.LeftIndex);
         CheckTree(header.RightIndex);
-        assert(!Fix(root));
+        assert(!FixLeft(root));
+        assert(!FixRight(root));
     }
 
     void Erase(TIndex idx, TIndex& root)
@@ -188,10 +221,11 @@ private:
         }
         if (Positions_[idx] < Positions_[root]) {
             Erase(idx, header.LeftIndex);
+            FixLeft(root);
         } else {
             Erase(idx, header.RightIndex);
+            FixRight(root);
         }
-        Fix(root);
     }
 
     TIndex Merge(TIndex left, TIndex right)
@@ -224,8 +258,8 @@ private:
 
     TAction SelectAction(uint64_t size, THeader& header, char* first, char* last)
     {
-        const auto leftFreeSpace = GetFreeSpace(header.LeftIndex, first, header.GetFirstPosition());
-        const auto rightFreeSpace = GetFreeSpace(header.RightIndex, header.GetLastPosition(), last);
+        const auto leftFreeSpace = (OffsetToPosition(header.FirstSubtreeOffset) - first) + header.LeftInnerFreeSpace;
+        const auto rightFreeSpace = header.RightInnerFreeSpace + (last - OffsetToPosition(header.LastSubtreeOffset));
 
         if (leftFreeSpace < size && rightFreeSpace < size) {
             return TAction::DEFRAGMENTATE;
@@ -262,7 +296,8 @@ private:
             newHeader.RightIndex = right;
             newHeader.HeapPriority = priority;
             root = idx;
-            Fix(root);
+            FixLeft(root);
+            FixRight(root);
             return;
         }
         {
@@ -270,19 +305,20 @@ private:
             auto action = SelectAction(size + sizeof(THeader), header, first, last);
             if (action == TAction::GO_LEFT) {
                 Insert(idx, priority, size, header.LeftIndex, first, header.GetFirstPosition());
-                Fix(root);
+                FixLeft(root);
                 return;
             }
             if (action == TAction::GO_RIGHT) {
                 Insert(idx, priority, size, header.RightIndex, header.GetLastPosition(), last);
-                Fix(root);
+                FixRight(root);
                 return;
             }
             assert(action == TAction::DEFRAGMENTATE);
         }
         DefragmentatePartial(root, first); // Modify `first`, invalidate header!
         Insert(idx, priority, size, GetHeader(root).RightIndex, first, last);
-        Fix(root);
+        FixLeft(root);
+        FixRight(root);
     }
 
     char* HardSplit(uint64_t size, TIndex root, TIndex& left, TIndex& right, char* first, char* last)
@@ -306,13 +342,13 @@ private:
             if (action == TAction::GO_LEFT) {
                 right = root;
                 char* position = HardSplit(size, header.LeftIndex, left, header.LeftIndex, first, header.GetFirstPosition());
-                Fix(root);
+                FixLeft(root);
                 return position;
             }
             if (action == TAction::GO_RIGHT) {
                 left = root;
                 char* position = HardSplit(size, header.RightIndex, header.RightIndex, right, header.GetLastPosition(), last);
-                Fix(root);
+                FixRight(root);
                 return position;
             }
             assert(action == TAction::DEFRAGMENTATE);
@@ -322,7 +358,8 @@ private:
             auto& header = GetHeader(root);
             left = root;
             char* position = HardSplit(size, header.RightIndex, header.RightIndex, right, first, last);
-            Fix(root);
+            FixLeft(root);
+            FixRight(root);
             return position;
         }
     }
@@ -352,7 +389,8 @@ private:
 
         DefragmentatePartial(root, first);
         Defragmentate(GetHeader(root).RightIndex, first);
-        Fix(root);
+        FixLeft(root);
+        FixRight(root);
     }
 
     TIndex AllocateIndex()
