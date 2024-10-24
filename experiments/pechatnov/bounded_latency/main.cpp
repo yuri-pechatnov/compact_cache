@@ -178,25 +178,6 @@ private:
         assert(!Fix(root));
     }
 
-    // Allocate `size` bytes for node `idx` under `root` on window [`first`, `last`)
-    void Insert(TIndex idx, uint32_t priority, uint64_t size, TIndex& root, char* first, char* last)
-    {
-        assert(GetFreeSpace(root, first, last) >= size + sizeof(THeader));
-        // Can be easily optimized.
-        TIndex left = NilIndex;
-        TIndex right = NilIndex;
-        char* position = HardSplit(size + sizeof(THeader), root, left, right, first, last);
-        Positions_[idx] = position - Data_.data();
-        auto& header = GetHeader(idx);
-        header.ValueSize = size;
-        header.LeftIndex = NilIndex;
-        header.RightIndex = NilIndex;
-        header.HeapPriority = priority;
-        Fix(idx);
-        root = Merge(left, idx);
-        root = Merge(root, right);
-    }
-
     void Erase(TIndex idx, TIndex& root)
     {
         assert(root != NilIndex);
@@ -234,6 +215,76 @@ private:
         }
     }
 
+    enum class TAction
+    {
+        GO_LEFT,
+        GO_RIGHT,
+        DEFRAGMENTATE,
+    };
+
+    TAction SelectAction(uint64_t size, THeader& header, char* first, char* last)
+    {
+        const auto leftFreeSpace = GetFreeSpace(header.LeftIndex, first, header.GetFirstPosition());
+        const auto rightFreeSpace = GetFreeSpace(header.RightIndex, header.GetLastPosition(), last);
+
+        if (leftFreeSpace < size && rightFreeSpace < size) {
+            return TAction::DEFRAGMENTATE;
+        }
+        if (
+            // If right is not acceptable - surely take left.
+            rightFreeSpace < size
+            || (
+                // If left is acceptable.
+                leftFreeSpace >= size
+                // And if there is smaller FillRate (FreeSpace / TotalSpace) in left part.
+                && (leftFreeSpace * (last - header.GetLastPosition()) > rightFreeSpace * (header.GetFirstPosition() - first))
+            )
+        ) {
+            return TAction::GO_LEFT;
+        } else {
+            assert(rightFreeSpace >= size);
+            return TAction::GO_RIGHT;
+        }
+    }
+
+    // Allocate `size` bytes for node `idx` under `root` on window [`first`, `last`)
+    void Insert(TIndex idx, uint32_t priority, uint64_t size, TIndex& root, char* first, char* last)
+    {
+        assert(GetFreeSpace(root, first, last) >= size + sizeof(THeader));
+        if (root == NilIndex || priority > GetHeader(root).HeapPriority) {
+            TIndex left = NilIndex;
+            TIndex right = NilIndex;
+            char* position = HardSplit(size + sizeof(THeader), root, left, right, first, last);
+            Positions_[idx] = position - Data_.data();
+            auto& newHeader = GetHeader(idx);
+            newHeader.ValueSize = size;
+            newHeader.LeftIndex = left;
+            newHeader.RightIndex = right;
+            newHeader.HeapPriority = priority;
+            root = idx;
+            Fix(root);
+            return;
+        }
+        {
+            auto& header = GetHeader(root);
+            auto action = SelectAction(size + sizeof(THeader), header, first, last);
+            if (action == TAction::GO_LEFT) {
+                Insert(idx, priority, size, header.LeftIndex, first, header.GetFirstPosition());
+                Fix(root);
+                return;
+            }
+            if (action == TAction::GO_RIGHT) {
+                Insert(idx, priority, size, header.RightIndex, header.GetLastPosition(), last);
+                Fix(root);
+                return;
+            }
+            assert(action == TAction::DEFRAGMENTATE);
+        }
+        DefragmentatePartial(root, first); // Modify `first`, invalidate header!
+        Insert(idx, priority, size, GetHeader(root).RightIndex, first, last);
+        Fix(root);
+    }
+
     char* HardSplit(uint64_t size, TIndex root, TIndex& left, TIndex& right, char* first, char* last)
     {
         const uint64_t freeSpace = GetFreeSpace(root, first, last);
@@ -244,42 +295,52 @@ private:
             right = NilIndex;
             return first;
         }
-        auto& header = GetHeader(root);
-        // std::cerr << "HardSplit (Root: " << root << ", RootFirst: " << (void*)header.GetFirstPosition() << ", First: " << (void*)first << ", Last:" << (void*)last
-        //     << ", FreeSpace: " << freeSpace << ", Size: " << size
-        //     << ")" << std::endl;
+        {
+            auto& header = GetHeader(root);
+            // std::cerr << "HardSplit (Root: " << root << ", RootFirst: " << (void*)header.GetFirstPosition() << ", First: " << (void*)first << ", Last:" << (void*)last
+            //     << ", FreeSpace: " << freeSpace << ", Size: " << size
+            //     << ")" << std::endl;
 
-        const auto leftFreeSpace = GetFreeSpace(header.LeftIndex, first, header.GetFirstPosition());
-        const auto rightFreeSpace = GetFreeSpace(header.RightIndex, header.GetLastPosition(), last);
+            auto action = SelectAction(size, header, first, last);
 
-        if (leftFreeSpace >= size || rightFreeSpace >= size) {
-            if (
-                // If right is not acceptable - surely take left.
-                rightFreeSpace < size
-                || (
-                    // If left is acceptable.
-                    leftFreeSpace >= size
-                    // And if there is smaller FillRate (FreeSpace / TotalSpace) in left part.
-                    && (leftFreeSpace * (last - header.GetLastPosition()) > rightFreeSpace * (header.GetFirstPosition() - first))
-                )
-            ) {
+            if (action == TAction::GO_LEFT) {
                 right = root;
                 char* position = HardSplit(size, header.LeftIndex, left, header.LeftIndex, first, header.GetFirstPosition());
                 Fix(root);
                 return position;
-            } else {
-                assert(rightFreeSpace >= size);
+            }
+            if (action == TAction::GO_RIGHT) {
                 left = root;
                 char* position = HardSplit(size, header.RightIndex, header.RightIndex, right, header.GetLastPosition(), last);
                 Fix(root);
                 return position;
             }
+            assert(action == TAction::DEFRAGMENTATE);
         }
+        DefragmentatePartial(root, first); // Modify `first`.
+        {
+            auto& header = GetHeader(root);
+            left = root;
+            char* position = HardSplit(size, header.RightIndex, header.RightIndex, right, first, last);
+            Fix(root);
+            return position;
+        }
+    }
 
-        char* startPosition = first;
-        Defragmentate(root, startPosition);
-        assert(last - startPosition == freeSpace); // Amount of free space must not be changed here.
-        return HardSplit(size, root, left, right, first, last); // Just retry after defragmentation.
+    // Only left part, no fix of root.
+    void DefragmentatePartial(TIndex root, char*& first)
+    {
+        assert(root != NilIndex);
+
+        auto& header = GetHeader(root);
+        Defragmentate(header.LeftIndex, first);
+
+        const uint64_t fullSize = header.GetLastPosition() - header.GetFirstPosition();
+        if (first != header.GetFirstPosition()) {
+            Positions_[root] = first - Data_.data();
+            std::memmove(first, header.GetFirstPosition(), fullSize); // Now `header` is invalid.
+        }
+        first += fullSize;
     }
 
     void Defragmentate(TIndex root, char*& first)
@@ -287,19 +348,10 @@ private:
         if (root == NilIndex) {
             return;
         }
-        auto& header = GetHeader(root);
-
         // std::cerr << "Defragmentate (Root: " << root << ", RootFirst: " << (void*)header.GetFirstPosition() << ", First: " << (void*)first << ")" << std::endl;
 
-        auto rightChildIndex = header.RightIndex;
-        Defragmentate(header.LeftIndex, first);
-
-        Positions_[root] = first - Data_.data();
-        const uint64_t fullSize = header.GetLastPosition() - header.GetFirstPosition();
-        std::memmove(first, header.GetFirstPosition(), fullSize); // Now `header` is invalid.
-        first += fullSize;
-
-        Defragmentate(rightChildIndex, first);
+        DefragmentatePartial(root, first);
+        Defragmentate(GetHeader(root).RightIndex, first);
         Fix(root);
     }
 
