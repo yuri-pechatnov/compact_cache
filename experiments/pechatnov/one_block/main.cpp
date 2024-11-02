@@ -64,40 +64,45 @@ public:
 
     std::pair<TValue, TIndex> Allocate(uint64_t size)
     {
-        auto& edata = EasyData_[++CurrentIndex_];
-        edata.resize(size);
-        return {{edata.data(), edata.size()}, CurrentIndex_};
+        auto idx = AllocateIndex();
+        auto& d = Data_[idx];
+        d = std::vector<char>{};
+        d->resize(size);
+        return {{d->data(), d->size()}, idx};
     }
 
     TValue Get(TIndex index)
     {
-        auto it = EasyData_.find(index);
-        if (it == EasyData_.end()) {
+        if (index >= Data_.size()) {
             return NilValue;
         }
-        auto& edata = it->second;
-        return {edata.data(), edata.size()};
+        auto& d = Data_[index];
+        if (!d.has_value()) {
+            return NilValue;
+        }
+        return {d->data(), d->size()};
     }
 
     bool Free(TIndex index)
     {
-        auto it = EasyData_.find(index);
-        if (it == EasyData_.end()) {
+        if (!Data_[index].has_value()) {
             return false;
         }
-        EasyData_.erase(it);
+        Data_[index].reset();
+        FreeIndex(index);
         return true;
     }
 
     uint64_t ElementsCount()
     {
-        return EasyData_.size();
+        return CurrentIndex_ - FreeIndexes_.size();
     }
 
     void Clear()
     {
         CurrentIndex_ = 0;
-        EasyData_.clear();
+        Data_.clear();
+        FreeIndexes_.clear();
     }
 
     double FillRate()
@@ -110,9 +115,28 @@ public:
         return 0;
     }
 private:
-    // Easy
+    TIndex AllocateIndex()
+    {
+        if (FreeIndexes_.empty()) {
+            FreeIndexes_.push_back(CurrentIndex_++);
+            if (CurrentIndex_ > Data_.size()) {
+                Data_.resize(CurrentIndex_ * 2);
+            }
+        }
+        auto idx = FreeIndexes_.back();
+        FreeIndexes_.pop_back();
+        return idx;
+    }
+
+    void FreeIndex(TIndex idx)
+    {
+        FreeIndexes_.push_back(idx);
+    }
+
+private:
     TIndex CurrentIndex_ = 0;
-    std::unordered_map<TIndex, std::vector<char>> EasyData_;
+    std::vector<TIndex> FreeIndexes_;
+    std::vector<std::optional<std::vector<char>>> Data_;
 };
 
 constexpr int GetRank(uint64_t x) {
