@@ -297,7 +297,7 @@ public:
 
             leftestNode.OwnIndex = NilIndex; // Important.
             leftestNode.ValueSize = 0; // Important.
-            leftestNode.LeftOffset = leftestOffset; // Not important.
+            leftestNode.LeftOffset = 0; // Important. It is marker.
             leftestNode.RightOffset = rightestOffset; // Important.
             leftestNode.LeftInRankOffset = leftestOffset; // Important.
             leftestNode.RightInRankOffset = leftestOffset; // Important.
@@ -305,7 +305,7 @@ public:
             rightestNode.OwnIndex = NilIndex; // Important.
             rightestNode.ValueSize = 0; // Important.
             rightestNode.LeftOffset = leftestOffset; // Important.
-            rightestNode.RightOffset = Data_.size(); // Important.
+            rightestNode.RightOffset = Data_.size(); // Important. It is marker.
             rightestNode.LeftInRankOffset = rightestOffset; // Important.
             rightestNode.RightInRankOffset = rightestOffset; // Important.
 
@@ -398,7 +398,37 @@ private:
 
     THeader& Defragmentate(uint64_t fullSize)
     {
-        THeader* header = &RankNodes_[MaxSizeRank];
+        THeader* header = nullptr;
+        // Find point to start defragmentation.
+        {
+            // Find random allocation.
+            TIndex startIndex = NilIndex;
+            while (true) {
+                startIndex = rand() % Positions_.size();
+                if (Positions_[startIndex] >= 0) {
+                    break;
+                }
+            }
+            // std::cerr << "Positions. ";
+            // for (int i = 0; i < Positions_.size(); ++i) {
+            //     std::cerr << i << ":" << Positions_[i] << ", ";
+            // }
+            // std::cerr << " first:" << FirstFreeIndex_ << std::endl;
+            header = &GetHeader(startIndex);
+            // Search for free space to the right.
+            uint64_t rightFreeSpace = 0;
+            THeader* currentHeader = header;
+            while (rightFreeSpace < fullSize && currentHeader->RightOffset != Data_.size()) {
+                rightFreeSpace += currentHeader->GetRightFreeSize(Data_.data());
+                currentHeader = &currentHeader->GetRightHeader(Data_.data());
+            }
+            // And to the left if need more.
+            while (rightFreeSpace < fullSize && header->LeftOffset != 0) {
+                header = &header->GetLeftHeader(Data_.data());
+                rightFreeSpace += header->GetRightFreeSize(Data_.data());
+            }
+            verify(rightFreeSpace >= fullSize);
+        }
         while (true) {
             if (header->GetRightFreeSize(Data_.data()) >= fullSize) {
                 return *header;
@@ -425,7 +455,7 @@ private:
             Positions_[nextHeader.OwnIndex] = newNextOffset;
 
             std::memmove(Data_.data() + newNextOffset, Data_.data() + oldNextOffset, nextFullSize); // Now `nextHeader` is invalid.
-            DefragmentatedBytes_ += fullSize;
+            DefragmentatedBytes_ += nextFullSize;
 
             header = &header->GetRightHeader(Data_.data());
 
@@ -487,13 +517,13 @@ private:
             }
         }
         auto idx = FirstFreeIndex_;
-        FirstFreeIndex_ = -(Positions_[idx] + 1);
+        FirstFreeIndex_ = -(Positions_[idx] + 2);
         return idx;
     }
 
     void FreeIndex(TIndex index)
     {
-        Positions_[index] = -static_cast<int64_t>(FirstFreeIndex_ + 1);
+        Positions_[index] = -static_cast<int64_t>(FirstFreeIndex_ + 2);
         FirstFreeIndex_ = index;
     }
 
@@ -851,7 +881,7 @@ void SSHM_StressTest()
 {
     srand(45);
     TStrStrHashMap m(1'000'000'000);
-    const int N = 9000000;
+    const int N = 4500000;
     std::vector<bool> filled(N, false);
     std::vector<std::string> keys(N);
     std::vector<char> valueData(1'000'000);
@@ -877,9 +907,8 @@ void SSHM_StressTest()
 
     {
         auto start = Now();
-        for (int i = 0; i < N; ++i) {
-            // std::cerr << i << std::endl;
-            const int j = rand() % (i < 1'000'000 ? N : N / 2);
+        for (int i = 0; i < N * 3; ++i) {
+            const int j = rand() % N;
             if (rand() % 4 > 0) {
                 m.Put(keys[j], values[j]);
                 filled[j] = true;
@@ -905,6 +934,28 @@ void SSHM_StressTest()
             auto [val, idx] = m.Get(keys[j]);
         }
         std::cerr << "Get " << "(Time: " << Now() - start << ", FillRate: " << m.FillRate() << ", Rss: " << Rss() << ")" << std::endl;
+    }
+    // Change pattern.
+    {
+        auto start = Now();
+        int J = 10;
+        uint64_t sz = 0;
+        for (int i = 0; i < N; ++i) {
+            if (filled[i]) {
+                if (rand() % J != 0) {
+                    sz += m.Get(keys[i]).first.size();
+                    m.Erase(keys[i]);
+                    filled[i] = false;
+                    if (rand() % (J - 1) == 0) {
+                        m.Put(keys[i], std::string_view{valueData.begin(), valueData.end()}.substr(0, sz));
+                        sz = 0;
+                    }
+                }
+            }
+
+        }
+        std::cerr << "Change-pattern " << "(J: " << J << ", Time: " << Now() - start << ", FillRate: " << m.FillRate()
+            << ", Rss: " << Rss() << ", DefragmentatedBytes:" << m.DefragmentatedBytes() << ")" << std::endl;
     }
 }
 
