@@ -429,12 +429,16 @@ private:
             }
             verify(rightFreeSpace >= fullSize);
         }
+        UnregisterFreeSpace(*header);
         while (true) {
             if (header->GetRightFreeSize(Data_.data()) >= fullSize) {
+                RegisterFreeSpace(*header);
                 return *header;
             }
             THeader& nextHeader = header->GetRightHeader(Data_.data());
             verify(nextHeader.RightOffset != Data_.size()); // If there is no space - abort.
+
+            UnregisterFreeSpace(nextHeader);
 
             const uint64_t nextFullSize = nextHeader.GetFullSize();
             const uint64_t oldNextOffset = nextHeader.GetFirstOffset(Data_.data());
@@ -447,9 +451,6 @@ private:
 
             THeader& afterNextHeader = nextHeader.GetRightHeader(Data_.data());
 
-            UnregisterFreeSpace(*header);
-            UnregisterFreeSpace(nextHeader);
-
             header->RightOffset = newNextOffset;
             afterNextHeader.LeftOffset = newNextOffset;
             Positions_[nextHeader.OwnIndex] = newNextOffset;
@@ -458,10 +459,7 @@ private:
             DefragmentatedBytes_ += nextFullSize;
 
             header = &header->GetRightHeader(Data_.data());
-
-            RegisterFreeSpace(*header);
         }
-        verify(false);
     }
 
     void UnregisterFreeSpace(THeader& header)
